@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import signal
 import sys
+import threading
 import weakref
 from inspect import iscoroutinefunction
 from typing import TYPE_CHECKING
@@ -92,6 +93,9 @@ class BaseLoop:
         self.__should_stop = 0
         self.__state = LoopState.off
         self.__is_initialized = False
+        # Calls made with call_soon_threadsafe() while the loop was not initialized.
+        self.__pending_threadsafe = []
+        self.__initialize_lock = threading.Lock()
         self.__interrupt_hook_data = None
         self.__callback_manager = CallbackManager(self)
         self.__asyncgens = weakref.WeakSet()
@@ -157,8 +161,17 @@ class BaseLoop:
         if self.__state == LoopState.off:
             self.__state = LoopState.ready
 
-        self.__is_initialized = True
-        self._rc_init()
+        with self.__initialize_lock:
+            self.__is_initialized = True
+            self._rc_init()
+            # Take the kept calls out and leave an empty list, so they can be
+            # dispatched below without holding the lock.
+            pending, self.__pending_threadsafe = self.__pending_threadsafe, []
+
+        # Dispatch the calls that other threads made before the loop was initialized.
+        # This runs in the loop's own thread, so _rc_call_soon() is safe to use.
+        for handle in pending:
+            self._rc_call_soon(handle._run)
 
         # Avoid circular ref
         loop_ref = weakref.ref(self)
@@ -234,12 +247,20 @@ class BaseLoop:
             raise TypeError("call_soon() expects a callable.")
         elif iscoroutinefunction(callback):
             raise TypeError("call_soon() expects a normal callable, not an async one.")
-        self._ensure_initialized()
 
-        # Create handle and dispatch it
         handle = self.__callback_manager.create_handle(
             "call_soon_threadsafe", callback, args
         )
+
+        # This method can be called from any thread, so it must not initialize the
+        # loop: a backend sets up state in _rc_init() that belongs to one thread.
+        # If the loop is not initialized (not used yet, or stopped), keep the call
+        # and dispatch it when the loop is initialized from its own thread.
+        with self.__initialize_lock:
+            if not self.__is_initialized:
+                self.__pending_threadsafe.append(handle)
+                return handle
+
         self._rc_call_soon_threadsafe(handle._run)
 
         return handle
@@ -439,7 +460,9 @@ class BaseLoop:
     def __stop(self):
         """Move to the off-state."""
 
-        self.__is_initialized = False
+        with self.__initialize_lock:
+            self.__is_initialized = False
+            self.__pending_threadsafe.clear()
 
         # Note that in here, we must fully bring our loop to a stop.
         # We cannot rely on future loop cycles.

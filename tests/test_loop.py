@@ -13,6 +13,7 @@ loop object and run it one time for the duration of the application.
 import gc
 import time
 import asyncio
+import threading
 
 from rendercanvas.base import BaseCanvasGroup, BaseRenderCanvas
 from rendercanvas.asyncio import AsyncioLoop
@@ -382,6 +383,56 @@ def test_loop_task_call_later(SomeLoop):
 
     for h in h4, h5, h6:
         assert "call_later" in repr(h)
+
+
+@pytest.mark.parametrize("SomeLoop", loop_classes)
+def test_loop_call_soon_threadsafe_from_other_thread(SomeLoop):
+    # call_soon_threadsafe() must not initialize the loop in the calling thread.
+    # With Qt that leaves the loop unable to start. It happened when wgpu's poll
+    # thread reported a frame download after the last canvas was closed.
+
+    init_threads = []
+
+    class RecordingLoop(SomeLoop):
+        def _rc_init(self):
+            init_threads.append(threading.current_thread())
+            super()._rc_init()
+
+    loop = RecordingLoop()
+    FooCanvas.select_loop(loop)
+
+    messages = []
+
+    def call_from_other_thread(m):
+        thread = threading.Thread(
+            target=loop.call_soon_threadsafe, args=(messages.append, m)
+        )
+        thread.start()
+        thread.join()
+
+    # Before the loop is first used
+    call_from_other_thread(1)
+    assert init_threads == []
+    assert "off" in repr(loop)
+
+    _canvas = FooCanvas()
+    loop.call_later(0.2, loop.stop)
+    loop.run()
+
+    assert set(init_threads) == {threading.main_thread()}
+    assert messages == [1]
+
+    # After the loop has stopped
+    call_from_other_thread(2)
+    assert set(init_threads) == {threading.main_thread()}
+    assert "off" in repr(loop)
+
+    _canvas = FooCanvas()
+    loop.call_later(0.2, loop.stop)
+    loop.run()
+
+    assert set(init_threads) == {threading.main_thread()}
+    assert messages == [1, 2]
 
 
 @pytest.mark.parametrize("SomeLoop", loop_classes)
